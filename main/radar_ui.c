@@ -7,6 +7,11 @@
 //   appui long 3 s = portail de configuration Wi-Fi.
 // - Écrans de connexion / localisation et écran du portail (QR code pour rejoindre RadarAvion_Wifi).
 // Toutes les fonctions de ce fichier s'exécutent dans la tâche LVGL.
+// ⚫ MODIFIÉ (24/10/2026) : performances : le fond (disques, cercles, graduations, points cardinaux,
+// distances) était redessiné à chaque image (masques circulaires sur 400x400 px, ~60 ms -> 8 img/s,
+// balayage saccadé). Il est maintenant dessiné une seule fois dans un canvas (PSRAM), redessiné
+// seulement au changement de zoom ; la traînée du balayage est faite de triangles (moins coûteux
+// que des secteurs d'arc). Ajout de l'écran "Code Wi-Fi" (nom du réseau, mot de passe, QR code).
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -37,13 +42,17 @@ LV_FONT_DECLARE(font_fr_28);
 #define TICK_MS         33       // ~30 images/s visées
 #define SWEEP_PERIOD_S  4.0f     // un tour de balayage
 #define TRAIL_DEG       70.0f    // longueur de la traînée du balayage
-#define TRAIL_STEPS     14
+// #define TRAIL_STEPS     14
+// ⚫ MODIFIÉ (24/10/2026) : 14 secteurs d'arc -> 10 triangles (7°)
+#define TRAIL_STEPS     10
 
 // --- entrées ---
 #define ENC_CW_ZOOMS_IN 1        // 1 : rotation horaire = zoom avant ; mettre 0 pour inverser
 #define ENC_LOCKOUT_MS  130      // un cran = un niveau de zoom (ignore les impulsions suivantes du même cran)
 #define BTN_SHORT_MS    600
 #define BTN_HOLD_MS     3000     // appui long -> configuration Wi-Fi
+// ⚫ AJOUTÉ (24/10/2026) : relâché entre BTN_SHORT_MS et BTN_HOLD_MS -> écran "Code Wi-Fi"
+#define WCODE_TIMEOUT_MS 60000   // écran "Code Wi-Fi" refermé après 1 min
 #define CARD_TIMEOUT_MS 20000    // fiche avion masquée après 20 s sans appui
 #define MAX_LABELS      25       // au-delà, seuls les avions sélectionnés gardent leur étiquette
 
@@ -75,6 +84,13 @@ typedef struct {
 
 // --- objets LVGL ---
 static lv_obj_t *s_radar;
+// ⚫ AJOUTÉ (24/10/2026) : fond pré-dessiné (canvas 480x480 RGB565 en PSRAM), parent de s_radar
+static lv_obj_t *s_bg;
+static int s_bg_zoom = -1;          // niveau de zoom des distances dessinées dans le fond
+// ⚫ AJOUTÉ (24/10/2026) : écran "Code Wi-Fi"
+static lv_obj_t *s_wcode, *s_wcode_qr, *s_wcode_ssid, *s_wcode_pass;
+static int64_t s_wcode_until_ms;
+static bool wcode_visible(void);   // défini plus bas (section "Code Wi-Fi")
 static lv_obj_t *s_zoom_pill, *s_zoom_lbl;
 static lv_obj_t *s_count_lbl, *s_city_lbl;
 static lv_obj_t *s_card, *s_card_title, *s_card_type, *s_card_body;
@@ -255,42 +271,72 @@ static bool project(float lat, float lon, int *x, int *y) {
     return true;
 }
 
-static void draw_background(lv_draw_ctx_t *ctx) {
+// static void draw_background(lv_draw_ctx_t *ctx) {
+//     // dégradé radial approché par 3 disques
+//     draw_disc(ctx, CX, CY, R_RADAR, C_DISC0, LV_OPA_COVER);
+//     draw_disc(ctx, CX, CY, R_RADAR * 7 / 10, C_DISC1, LV_OPA_COVER);
+//     draw_disc(ctx, CX, CY, R_RADAR * 4 / 10, C_DISC2, LV_OPA_COVER);
+// }
+// ⚫ RETIRÉ (24/10/2026) : draw_background() et draw_grid() (cercles de distance, croix, graduations tous
+// les 10° (plus longues tous les 30°), points cardinaux dans la marge extérieure, distances des cercles
+// le long du relèvement 30°) dessinaient tout à chaque image -> render_background() : même rendu,
+// dessiné une seule fois dans le canvas s_bg.
+
+static void bg_disc(int r, uint32_t rgb) {
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.radius = LV_RADIUS_CIRCLE;
+    d.bg_color = lv_color_hex(rgb);
+    d.bg_opa = LV_OPA_COVER;
+    lv_canvas_draw_rect(s_bg, CX - r, CY - r, 2 * r + 1, 2 * r + 1, &d);
+}
+
+static void bg_line(int x0, int y0, int x1, int y1, int w, lv_opa_t opa) {
+    lv_draw_line_dsc_t d;
+    lv_draw_line_dsc_init(&d);
+    d.color = lv_color_hex(C_RING);
+    d.width = w;
+    d.opa = opa;
+    lv_point_t p[2] = { { x0, y0 }, { x1, y1 } };
+    lv_canvas_draw_line(s_bg, p, 2, &d);
+}
+
+static void bg_text(int x, int y, int w, const char *txt, const lv_font_t *font, uint32_t rgb, lv_text_align_t align) {
+    lv_draw_label_dsc_t d;
+    lv_draw_label_dsc_init(&d);
+    d.font = font;
+    d.color = lv_color_hex(rgb);
+    d.align = align;
+    lv_canvas_draw_text(s_bg, x, y, w, &d, txt);
+}
+
+// Fond fixe du radar, redessiné uniquement quand le zoom change (distances des cercles)
+static void render_background(void) {
+    int64_t t0 = esp_timer_get_time();
+    lv_canvas_fill_bg(s_bg, lv_color_black(), LV_OPA_COVER);
     // dégradé radial approché par 3 disques
-    draw_disc(ctx, CX, CY, R_RADAR, C_DISC0, LV_OPA_COVER);
-    draw_disc(ctx, CX, CY, R_RADAR * 7 / 10, C_DISC1, LV_OPA_COVER);
-    draw_disc(ctx, CX, CY, R_RADAR * 4 / 10, C_DISC2, LV_OPA_COVER);
-}
-
-static void draw_sweep(lv_draw_ctx_t *ctx) {
-    float step = TRAIL_DEG / TRAIL_STEPS;
-    for (int i = 0; i < TRAIL_STEPS; i++) {
-        float k = 1.0f - (float)i / TRAIL_STEPS;
-        lv_opa_t opa = (lv_opa_t)(95.0f * k * k);
-        if (opa < 4) {
-            break;
-        }
-        draw_arc(ctx, R_RADAR, R_RADAR, s_sweep_deg - (i + 1) * step, s_sweep_deg - i * step, C_SWEEP, opa);
-    }
-    float a = s_sweep_deg * DEG2RAD;
-    draw_line(ctx, CX, CY, CX + (int)lroundf(R_RADAR * sinf(a)), CY - (int)lroundf(R_RADAR * cosf(a)), 2, C_SWEEP, 230);
-}
-
-static void draw_grid(lv_draw_ctx_t *ctx) {
+    bg_disc(R_RADAR, C_DISC0);
+    bg_disc(R_RADAR * 7 / 10, C_DISC1);
+    bg_disc(R_RADAR * 4 / 10, C_DISC2);
     // cercles de distance
     for (int k = 1; k <= 4; k++) {
-        draw_arc(ctx, R_RADAR * k / 4, k == 4 ? 2 : 1, 0, 360, C_RING, k == 4 ? 220 : 110);
+        lv_draw_arc_dsc_t d;
+        lv_draw_arc_dsc_init(&d);
+        d.color = lv_color_hex(C_RING);
+        d.width = k == 4 ? 2 : 1;
+        d.opa = k == 4 ? 220 : 110;
+        lv_canvas_draw_arc(s_bg, CX, CY, R_RADAR * k / 4, 0, 360, &d);
     }
     // croix
-    draw_line(ctx, CX - R_RADAR, CY, CX + R_RADAR, CY, 1, C_RING, 70);
-    draw_line(ctx, CX, CY - R_RADAR, CX, CY + R_RADAR, 1, C_RING, 70);
+    bg_line(CX - R_RADAR, CY, CX + R_RADAR, CY, 1, 70);
+    bg_line(CX, CY - R_RADAR, CX, CY + R_RADAR, 1, 70);
     // graduations tous les 10° (plus longues tous les 30°)
     for (int deg = 0; deg < 360; deg += 10) {
-        float a = deg * DEG2RAD, s = sinf(a), c = cosf(a);
+        float a = deg * DEG2RAD, sn = sinf(a), cs = cosf(a);
         int len = (deg % 30 == 0) ? 12 : 6;
-        draw_line(ctx, CX + (int)lroundf((R_RADAR - len) * s), CY - (int)lroundf((R_RADAR - len) * c),
-                  CX + (int)lroundf(R_RADAR * s), CY - (int)lroundf(R_RADAR * c),
-                  deg % 30 == 0 ? 2 : 1, C_RING, 200);
+        bg_line(CX + (int)lroundf((R_RADAR - len) * sn), CY - (int)lroundf((R_RADAR - len) * cs),
+                CX + (int)lroundf(R_RADAR * sn), CY - (int)lroundf(R_RADAR * cs),
+                deg % 30 == 0 ? 2 : 1, 200);
     }
     // points cardinaux dans la marge extérieure
     static const char *CARD[4] = { "N", "E", "S", "O" };
@@ -298,21 +344,49 @@ static void draw_grid(lv_draw_ctx_t *ctx) {
         float a = i * 90 * DEG2RAD;
         int x = CX + (int)lroundf(R_CARDINAL * sinf(a));
         int y = CY - (int)lroundf(R_CARDINAL * cosf(a));
-        draw_text(ctx, x - 12, y - 9, 24, 20, CARD[i], &lv_font_montserrat_16, i == 0 ? C_NORTH : C_LABEL,
-                  LV_OPA_COVER, LV_TEXT_ALIGN_CENTER);
+        bg_text(x - 12, y - 9, 24, CARD[i], &lv_font_montserrat_16, i == 0 ? C_NORTH : C_LABEL, LV_TEXT_ALIGN_CENTER);
     }
-    // distances des cercles, le long du relèvement 30°
+    // distances des cercles (niveau de zoom choisi), le long du relèvement 30°
     char t[16];
+    float range = ZOOM_KM[s_zoom_idx];
     for (int k = 1; k <= 4; k++) {
         float r = R_RADAR * k / 4.0f;
-        fmt_km(t, sizeof(t) - 3, s_range_km * k / 4.0f);
+        fmt_km(t, sizeof(t) - 3, range * k / 4.0f);
         if (k == 4) {
             strcat(t, " km");
         }
-        int x = CX + (int)lroundf(r * 0.5f) + 3;
-        int y = CY - (int)lroundf(r * 0.866f) + 2;
-        draw_text(ctx, x, y, 60, 16, t, &lv_font_montserrat_12, C_LABEL, 210, LV_TEXT_ALIGN_LEFT);
+        bg_text(CX + (int)lroundf(r * 0.5f) + 3, CY - (int)lroundf(r * 0.866f) + 2, 60, t,
+                &lv_font_montserrat_12, C_LABEL, LV_TEXT_ALIGN_LEFT);
     }
+    s_bg_zoom = s_zoom_idx;
+    ESP_LOGI(TAG, "Fond du radar dessine en %lld ms", (esp_timer_get_time() - t0) / 1000);
+}
+
+static void draw_sweep(lv_draw_ctx_t *ctx) {
+    float step = TRAIL_DEG / TRAIL_STEPS;
+    // ⚫ MODIFIÉ (24/10/2026) : secteurs d'arc (draw_arc de largeur = rayon : masques circulaires + angulaires
+    // sur tout le secteur) remplacés par des triangles centre -> bord (corde à 7° : < 0,4 px du cercle)
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_color = lv_color_hex(C_SWEEP);
+    for (int i = 0; i < TRAIL_STEPS; i++) {
+        float k = 1.0f - (float)i / TRAIL_STEPS;
+        lv_opa_t opa = (lv_opa_t)(95.0f * k * k);
+        if (opa < 4) {
+            break;
+        }
+        // draw_arc(ctx, R_RADAR, R_RADAR, s_sweep_deg - (i + 1) * step, s_sweep_deg - i * step, C_SWEEP, opa);
+        float a0 = (s_sweep_deg - (i + 1) * step) * DEG2RAD, a1 = (s_sweep_deg - i * step) * DEG2RAD;
+        lv_point_t p[3] = {
+            { CX, CY },
+            { CX + (lv_coord_t)lroundf(R_RADAR * sinf(a0)), CY - (lv_coord_t)lroundf(R_RADAR * cosf(a0)) },
+            { CX + (lv_coord_t)lroundf(R_RADAR * sinf(a1)), CY - (lv_coord_t)lroundf(R_RADAR * cosf(a1)) },
+        };
+        d.bg_opa = opa;
+        lv_draw_polygon(ctx, &d, p, 3);
+    }
+    float a = s_sweep_deg * DEG2RAD;
+    draw_line(ctx, CX, CY, CX + (int)lroundf(R_RADAR * sinf(a)), CY - (int)lroundf(R_RADAR * cosf(a)), 2, C_SWEEP, 230);
 }
 
 static void draw_aircraft(lv_draw_ctx_t *ctx) {
@@ -373,9 +447,10 @@ static void draw_center(lv_draw_ctx_t *ctx) {
 static void radar_draw_cb(lv_event_t *e) {
     int64_t t0 = esp_timer_get_time();
     lv_draw_ctx_t *ctx = lv_event_get_draw_ctx(e);
-    draw_background(ctx);
+    // draw_background(ctx);
+    // ⚫ MODIFIÉ (24/10/2026) : fond et grille pré-dessinés dans s_bg (parent de s_radar)
     draw_sweep(ctx);
-    draw_grid(ctx);
+    // draw_grid(ctx);
     if (s_st.phase == APP_PHASE_RADAR) {
         draw_aircraft(ctx);
     }
@@ -552,10 +627,17 @@ static void apply_status(void) {
         lv_obj_add_flag(s_city_lbl, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_card, LV_OBJ_FLAG_HIDDEN);
         if (portal) {
-            lv_obj_add_flag(s_radar, LV_OBJ_FLAG_HIDDEN);   // le radar n'est plus redessiné (CPU)
+            // lv_obj_add_flag(s_radar, LV_OBJ_FLAG_HIDDEN);   // le radar n'est plus redessiné (CPU)
+            // ⚫ MODIFIÉ (24/10/2026) : fond + radar (s_radar est un enfant de s_bg)
+            lv_obj_add_flag(s_bg, LV_OBJ_FLAG_HIDDEN);   // le radar n'est plus redessiné (CPU)
+            lv_obj_add_flag(s_wcode, LV_OBJ_FLAG_HIDDEN);
             lv_obj_clear_flag(s_portal, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_clear_flag(s_radar, LV_OBJ_FLAG_HIDDEN);
+            // lv_obj_clear_flag(s_radar, LV_OBJ_FLAG_HIDDEN);
+            // ⚫ MODIFIÉ (24/10/2026) : fond + radar
+            if (!wcode_visible()) {
+                lv_obj_clear_flag(s_bg, LV_OBJ_FLAG_HIDDEN);
+            }
             if (radar) {
                 lv_obj_clear_flag(s_zoom_pill, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_clear_flag(s_count_lbl, LV_OBJ_FLAG_HIDDEN);
@@ -582,6 +664,55 @@ static void apply_status(void) {
     } else if (!radar) {
         set_text(s_msg_lbl, s_st.info[0] ? s_st.info : "Démarrage");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// ⚫ AJOUTÉ (24/10/2026) : écran "Code Wi-Fi" (réseau enregistré, mot de passe, QR code pour s'y connecter)
+// ---------------------------------------------------------------------------------------------
+// Échappement des caractères spéciaux du format "WIFI:" (\ ; , : ")
+static void qr_escape(char *dst, size_t cap, const char *src) {
+    size_t o = 0;
+    for (; *src && o + 2 < cap; src++) {
+        if (strchr("\\;,:\"", *src)) {
+            dst[o++] = '\\';
+        }
+        dst[o++] = *src;
+    }
+    dst[o] = 0;
+}
+
+static bool wcode_visible(void) {
+    return !lv_obj_has_flag(s_wcode, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void wcode_hide(void) {
+    lv_obj_add_flag(s_wcode, LV_OBJ_FLAG_HIDDEN);
+    if (s_st.phase != APP_PHASE_PORTAL) {
+        lv_obj_clear_flag(s_bg, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wcode_show(void) {
+    app_config_t cfg;
+    app_config_load(&cfg);
+    if (!cfg.ssid[0]) {
+        return;
+    }
+    char ssid[80], pass[140], qr[240];
+    qr_escape(ssid, sizeof(ssid), cfg.ssid);
+    qr_escape(pass, sizeof(pass), cfg.pass);
+    if (cfg.pass[0]) {
+        snprintf(qr, sizeof(qr), "WIFI:T:WPA;S:%s;P:%s;;", ssid, pass);
+    } else {
+        snprintf(qr, sizeof(qr), "WIFI:T:nopass;S:%s;;", ssid);
+    }
+    lv_qrcode_update(s_wcode_qr, qr, strlen(qr));
+    set_text(s_wcode_ssid, cfg.ssid);
+    set_text(s_wcode_pass, cfg.pass[0] ? cfg.pass : "(réseau ouvert)");
+    memset(&cfg, 0, sizeof(cfg));
+    lv_obj_add_flag(s_bg, LV_OBJ_FLAG_HIDDEN);   // le radar n'est plus redessiné pendant ce temps
+    lv_obj_clear_flag(s_wcode, LV_OBJ_FLAG_HIDDEN);
+    s_wcode_until_ms = now_ms() + WCODE_TIMEOUT_MS;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -626,8 +757,12 @@ static void handle_input(void) {
         s_btn_down = true;
         s_btn_fired = false;
         s_btn_t0_ms = now;
+        // ⚫ AJOUTÉ (24/10/2026) : le texte est remplacé par "Configuration Wi-Fi..." une fois l'appui long atteint
+        lv_label_set_text(s_hold_lbl, "Relâchez : code Wi-Fi\nMaintenez : configuration");
     }
-    if (down && !s_btn_fired && s_st.phase != APP_PHASE_PORTAL) {
+    // if (down && !s_btn_fired && s_st.phase != APP_PHASE_PORTAL) {
+    // ⚫ MODIFIÉ (24/10/2026) : pas d'appui long pendant l'affichage du code Wi-Fi (un appui le referme)
+    if (down && !s_btn_fired && s_st.phase != APP_PHASE_PORTAL && !wcode_visible()) {
         int64_t held = now - s_btn_t0_ms;
         if (held > BTN_SHORT_MS) {
             lv_arc_set_value(s_hold_arc, (int)((held - BTN_SHORT_MS) * 100 / (BTN_HOLD_MS - BTN_SHORT_MS)));
@@ -645,7 +780,15 @@ static void handle_input(void) {
         if (!s_btn_fired) {
             lv_obj_add_flag(s_hold_arc, LV_OBJ_FLAG_HIDDEN);
             lv_obj_add_flag(s_hold_lbl, LV_OBJ_FLAG_HIDDEN);
-            if (now - s_btn_t0_ms < BTN_SHORT_MS) {
+            if (wcode_visible()) {
+                // ⚫ AJOUTÉ (24/10/2026) : un appui referme l'écran "Code Wi-Fi"
+                wcode_hide();
+            } else if (now - s_btn_t0_ms >= BTN_SHORT_MS) {
+                // ⚫ AJOUTÉ (24/10/2026) : appui moyen (0,6 à 3 s) -> code Wi-Fi
+                if (s_st.phase != APP_PHASE_PORTAL) {
+                    wcode_show();
+                }
+            } else if (now - s_btn_t0_ms < BTN_SHORT_MS) {
                 if (radar) {
                     select_next();
                     update_texts();
@@ -682,6 +825,14 @@ static void ui_tick(lv_timer_t *t) {
 
     s_sweep_deg = wrap360(s_sweep_deg + dt * 360.0f / SWEEP_PERIOD_S);
 
+    // ⚫ AJOUTÉ (24/10/2026) : fond redessiné seulement si le zoom a changé
+    if (s_bg_zoom != s_zoom_idx) {
+        render_background();
+    }
+    if (wcode_visible() && now >= s_wcode_until_ms) {
+        wcode_hide();
+    }
+
     if (s_st.phase == APP_PHASE_RADAR) {
         adsb_copy_if_new(s_snap, &s_seq);
         compute_visible();
@@ -699,7 +850,9 @@ static void ui_tick(lv_timer_t *t) {
     radar_led_set(s_st.phase, s_sweep_deg, sel ? sel->brg_deg : -1.0f,
                   sel ? alt_rgb(&s_snap->ac[sel->idx]) : 0);
 
-    if (!lv_obj_has_flag(s_radar, LV_OBJ_FLAG_HIDDEN)) {
+    // if (!lv_obj_has_flag(s_radar, LV_OBJ_FLAG_HIDDEN)) {
+    // ⚫ MODIFIÉ (24/10/2026) : c'est le fond s_bg (parent de s_radar) qui est masqué en mode portail / code Wi-Fi
+    if (!lv_obj_has_flag(s_bg, LV_OBJ_FLAG_HIDDEN)) {
         lv_obj_invalidate(s_radar);
     }
 
@@ -794,8 +947,19 @@ void radar_ui_init(void) {
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    // ⚫ AJOUTÉ (24/10/2026) : fond pré-dessiné (canvas RGB565 480x480 en PSRAM)
+    void *bg_buf = heap_caps_malloc(LV_CANVAS_BUF_SIZE_TRUE_COLOR(480, 480), MALLOC_CAP_SPIRAM);
+    assert(bg_buf);
+    s_bg = lv_canvas_create(scr);
+    lv_canvas_set_buffer(s_bg, bg_buf, 480, 480, LV_IMG_CF_TRUE_COLOR);
+    lv_obj_set_pos(s_bg, 0, 0);
+    lv_obj_clear_flag(s_bg, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    render_background();
+
     // radar dessiné à la main
-    s_radar = lv_obj_create(scr);
+    // s_radar = lv_obj_create(scr);
+    // ⚫ MODIFIÉ (24/10/2026) : enfant du fond (masqués ensemble)
+    s_radar = lv_obj_create(s_bg);
     lv_obj_remove_style_all(s_radar);
     lv_obj_set_size(s_radar, 480, 480);
     lv_obj_clear_flag(s_radar, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
@@ -846,6 +1010,36 @@ void radar_ui_init(void) {
     lv_obj_align(s_msg_lbl, LV_ALIGN_TOP_MID, 0, 66);
 
     build_portal(scr);
+
+    // ⚫ AJOUTÉ (24/10/2026) : écran "Code Wi-Fi"
+    s_wcode = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_wcode);
+    lv_obj_set_size(s_wcode, 480, 480);
+    lv_obj_set_style_bg_color(s_wcode, lv_color_hex(0x020c07), 0);
+    lv_obj_set_style_bg_opa(s_wcode, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s_wcode, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *wt = make_label(s_wcode, &font_fr_28, 0x5dffa8, "Code Wi-Fi");
+    lv_obj_align(wt, LV_ALIGN_TOP_MID, 0, 40);
+    s_wcode_ssid = make_label(s_wcode, &font_fr_20, C_DIM, "");
+    lv_obj_set_width(s_wcode_ssid, 320);
+    lv_label_set_long_mode(s_wcode_ssid, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_wcode_ssid, LV_ALIGN_TOP_MID, 0, 80);
+    lv_obj_t *wbox = lv_obj_create(s_wcode);
+    lv_obj_remove_style_all(wbox);
+    lv_obj_set_size(wbox, 178, 178);
+    lv_obj_set_style_bg_color(wbox, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(wbox, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(wbox, 12, 0);
+    lv_obj_align(wbox, LV_ALIGN_CENTER, 0, -18);
+    s_wcode_qr = lv_qrcode_create(wbox, 156, lv_color_black(), lv_color_white());
+    lv_obj_center(s_wcode_qr);
+    s_wcode_pass = make_label(s_wcode, &font_fr_28, 0xffffff, "");
+    lv_obj_set_width(s_wcode_pass, 360);
+    lv_label_set_long_mode(s_wcode_pass, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_wcode_pass, LV_ALIGN_CENTER, 0, 110);
+    lv_obj_t *wh = make_label(s_wcode, &font_fr_20, C_DIM, "Appui : retour au radar");
+    lv_obj_align(wh, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lv_obj_add_flag(s_wcode, LV_OBJ_FLAG_HIDDEN);
 
     // appui long : anneau de progression sur le bord de l'écran
     s_hold_arc = lv_arc_create(scr);

@@ -40,10 +40,13 @@ CONFIG_LV_COLOR_SCREEN_TRANSP=y
 # QR code du portail Wi-Fi (écran de configuration)
 CONFIG_LV_USE_QRCODE=y
 # Tampons TLS (HTTPS adsb.fi) en PSRAM : préserve la RAM interne (Wi-Fi, LVGL)
-CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# ⚫ RETIRÉ (24/10/2026) : resets watchdog silencieux (TG1WDT_SYS_RST) pendant les requêtes HTTPS, avec la PSRAM
+# déjà très sollicitée par l'écran RGB : TLS remis en RAM interne (126 Ko libres, ~45 Ko par connexion)
 # Les navigateurs des téléphones envoient de longs en-têtes (portail captif) : 512 -> erreurs 431
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 # Écran RGB + Wi-Fi + PSRAM : meilleure bande passante PSRAM et resynchronisation de l'image
 # si elle "glisse" (écritures en flash, forte charge)
-CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+# CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+# ⚫ RETIRÉ (24/10/2026) : ligne de cache 64 o retirée (même raison, valeur d'origine 32 o qui fonctionnait)
 CONFIG_LCD_RGB_RESTART_IN_VSYNC=y

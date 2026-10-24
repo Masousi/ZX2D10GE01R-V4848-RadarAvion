@@ -28,6 +28,8 @@
 static button_t *g_btn;
 
 static esp_lcd_panel_handle_t g_panel_handle = NULL;
+// ⚫ AJOUTÉ (24/10/2026) : donné à chaque VSYNC (fin de trame) par __qsmd_rgb_on_vsync()
+static SemaphoreHandle_t s_vsync_sem;
 
 static void __qsmd_rgb_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p)
 {
@@ -36,8 +38,47 @@ static void __qsmd_rgb_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area
     int offsety1 = area->y1;
     int offsety2 = area->y2;
 
+    // esp_lcd_panel_draw_bitmap(g_panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_p);
+    // lv_disp_flush_ready(disp_drv);
+    // ⚫ MODIFIÉ (24/10/2026) : synchronisation VSYNC (correction du clignotement).
+    // draw_bitmap() ne fait que programmer le passage sur ce buffer pour la trame SUIVANTE (IDF 5.0.9,
+    // double_fb) : la trame en cours est encore lue dans l'autre buffer. Appeler lv_disp_flush_ready()
+    // tout de suite faisait redessiner par LVGL le buffer en cours d'affichage -> images à moitié
+    // dessinées visibles = clignotement permanent (le radar redessine tout l'écran à chaque image).
+    // 1) attendre un début de trame (loin de la fin, où le DMA lit le pointeur du buffer suivant),
+    // 2) programmer le nouveau buffer,
+    // 3) attendre le début de trame suivant : l'écran lit alors le nouveau buffer, l'ancien est libre.
+    // xSemaphoreTake(s_vsync_sem, 0);
+    // xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(50));
+    // ⚫ RETIRÉ (24/10/2026) : étape 1 inutile avec CONFIG_LCD_RGB_RESTART_IN_VSYNC (sdkconfig.defaults) :
+    // le pilote relance le DMA sur le buffer courant à chaque VSYNC, le changement de buffer a donc lieu
+    // exactement à la trame suivante. Cette attente coûtait jusqu'à une trame (~17 ms) par image.
+    int64_t t0 = esp_timer_get_time();
     esp_lcd_panel_draw_bitmap(g_panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_p);
+    // ⚫ AJOUTÉ (24/10/2026) : draw_bitmap() vide le cache vers la PSRAM (460 Ko) : il doit rester bien
+    // plus court qu'une trame (~17 ms) pour que l'étape 2 tombe loin de la fin de trame. Contrôle série :
+    static int64_t s_bmp_max_us;
+    static int s_bmp_n;
+    int64_t dt = esp_timer_get_time() - t0;
+    if (dt > s_bmp_max_us) {
+        s_bmp_max_us = dt;
+    }
+    if (++s_bmp_n == 300) {
+        ESP_LOGI(TAG, "draw_bitmap max %lld us (300 images)", s_bmp_max_us);
+        s_bmp_n = 0;
+        s_bmp_max_us = 0;
+    }
+    xSemaphoreTake(s_vsync_sem, 0);
+    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(50));
     lv_disp_flush_ready(disp_drv);
+}
+
+// ⚫ AJOUTÉ (24/10/2026) : interruption de fin de trame (VSYNC) -> débloque __qsmd_rgb_disp_flush()
+static IRAM_ATTR bool __qsmd_rgb_on_vsync(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_vsync_sem, &woken);
+    return woken == pdTRUE;
 }
 
 void qmsd_rgb_init(esp_lcd_rgb_panel_config_t *panel_config)
@@ -51,6 +92,12 @@ void qmsd_rgb_init(esp_lcd_rgb_panel_config_t *panel_config)
     lv_init();
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(panel_config, &g_panel_handle));
+    // ⚫ AJOUTÉ (24/10/2026) : synchronisation de l'affichage sur le VSYNC (cf. __qsmd_rgb_disp_flush)
+    s_vsync_sem = xSemaphoreCreateBinary();
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        .on_vsync = __qsmd_rgb_on_vsync,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(g_panel_handle, &cbs, NULL));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel_handle));
 

@@ -37,6 +37,7 @@ pour centrer le radar sur chez vous, saisir latitude/longitude dans le portail.
 | Rotation de l'encodeur | zoom : rayon 2, 5, 10, 20, 40, 80, 160 km (mémorisé) |
 | Appui court | sélection de l'avion suivant (du plus proche au plus lointain) : fiche indicatif, type, altitude, montée/descente, vitesse, cap, distance, immatriculation ; puis plus de sélection |
 | Appui long 3 s | portail de configuration Wi-Fi (anneau orange de progression) |
+| Appui moyen (relâché entre 0,6 et 3 s) | <!-- ⚫ AJOUTÉ (24/10/2026) --> écran **Code Wi-Fi** : nom du réseau, mot de passe et QR code pour y connecter un téléphone (appui = retour, fermeture auto après 1 min) |
 
 - Balayage rotatif (4 s/tour) avec traînée, cercles de distance, points cardinaux (N en orange).
 - Avions : triangle orienté selon la route, **couleur selon l'altitude** (orange < 3 000 ft, jaune < 10 000,
@@ -63,6 +64,11 @@ pour centrer le radar sur chez vous, saisir latitude/longitude dans le portail.
 | `main/font_fr_20.c`, `font_fr_28.c` | polices avec accents (Latin-1) |
 
 Journal série toutes les 10 s : images/s, temps de dessin, nombre d'avions, mémoire libre.
+
+<!-- ⚫ AJOUTÉ (24/10/2026) -->
+Affichage : le fond (disques, cercles, graduations) est pré-dessiné dans un canvas et redessiné seulement au
+changement de zoom ; l'image est synchronisée sur le VSYNC de l'écran (`main/screen.c`) pour éviter le
+clignotement (LVGL ne dessine jamais dans le buffer en cours d'affichage).
 
 ## Matériel / environnement
 
