@@ -1,0 +1,49 @@
+# ⚫ AJOUTÉ (24/10/2026) : valeurs matérielles ZX2D10 (ESP32-S3 N16R8) réappliquées si sdkconfig est régénéré
+# (ex. 'Set Espressif Device Target' / idf.py set-target a remis PSRAM off, flash 2MB, partitions par défaut => écran noir)
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_lvgl.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_lvgl.csv"
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_LV_COLOR_DEPTH_16=y
+# CONFIG_LV_MEM_SIZE_KILOBYTES=64
+# ⚫ 24/10/2026 : LVGL alloue via malloc (heap ESP-IDF + 7,6 Mo de PSRAM) au lieu d'un tas fixe de 64 Ko :
+# une interface 480x480 dépasse vite 64 Ko -> LV_ASSERT_MALLOC -> boucle infinie silencieuse -> écran noir
+CONFIG_LV_MEM_CUSTOM=y
+# ⚫ 24/10/2026 : logs LVGL (WARN+) sur le port série, pour ne plus avoir de blocage silencieux
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_WARN=y
+CONFIG_LV_LOG_PRINTF=y
+CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
+CONFIG_LV_FONT_MONTSERRAT_12=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_USE_FONT_COMPRESSED=y
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+# ⚫ 24/10/2026 : nécessaire aux widgets semi-transparents (opa / transform) :
+# sans cela LVGL logue "Rendering this widget needs LV_COLOR_SCREEN_TRANSP 1" et ne les dessine pas
+CONFIG_LV_COLOR_SCREEN_TRANSP=y
+# ⚫ RETIRÉ (24/10/2026) : choix de la démo (APP_DEMO_RUN_*) et démos LVGL (LV_USE_DEMO_*), supprimées du projet
+# ⚫ AJOUTÉ (24/10/2026) : RadarAvion
+# QR code du portail Wi-Fi (écran de configuration)
+CONFIG_LV_USE_QRCODE=y
+# Tampons TLS (HTTPS adsb.fi) en PSRAM : préserve la RAM interne (Wi-Fi, LVGL)
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# Les navigateurs des téléphones envoient de longs en-têtes (portail captif) : 512 -> erreurs 431
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+# Écran RGB + Wi-Fi + PSRAM : meilleure bande passante PSRAM et resynchronisation de l'image
+# si elle "glisse" (écritures en flash, forte charge)
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_LCD_RGB_RESTART_IN_VSYNC=y

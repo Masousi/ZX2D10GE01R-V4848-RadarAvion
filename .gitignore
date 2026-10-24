@@ -1,0 +1,26 @@
+# ⚫ AJOUTÉ (24/10/2026) : fichiers générés / locaux exclus du dépôt
+build/
+.vscode/
+sdkconfig.old
+# ⚫ AJOUTÉ (24/10/2026) : caches / fichiers locaux IDE et OS
+.cache/
+.clangd
+.devcontainer/
+managed_components/
+*.log
+Thumbs.db
+desktop.ini
+.DS_Store
+# ⚫ AJOUTÉ (24/10/2026) : parties de LVGL inutiles à la compilation (esp.cmake ne compile que src/*.c ;
+# aucune démo ni exemple utilisé par main/)
+components/lvgl/.github/
+components/lvgl/demos/
+components/lvgl/docs/
+components/lvgl/examples/
+components/lvgl/scripts/
+components/lvgl/tests/
+# ⚫ AJOUTÉ (24/10/2026) : ports LVGL non-ESP (CMSIS 5 Mo, RT-Thread, Zephyr) et police TTF jamais compilée
+components/lvgl/env_support/cmsis-pack/
+components/lvgl/env_support/rt-thread/
+components/lvgl/env_support/zephyr/
+components/lvgl/src/font/korean.ttf
