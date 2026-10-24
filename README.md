@@ -34,7 +34,7 @@ pour centrer le radar sur chez vous, saisir latitude/longitude dans le portail.
 
 | Action | Effet |
 |---|---|
-| Rotation de l'encodeur | zoom : rayon 2, 5, 10, 20, 40, 80, 160 km (mémorisé) |
+| Rotation de l'encodeur | zoom : rayon 2, 5, 10, 20, 40, 80, 160 km (40 km au démarrage ; non mémorisé : aucune écriture en flash pendant l'affichage) |
 | Appui court | sélection de l'avion suivant (du plus proche au plus lointain) : fiche indicatif, type, altitude, montée/descente, vitesse, cap, distance, immatriculation ; puis plus de sélection |
 | Appui long 3 s | portail de configuration Wi-Fi (anneau orange de progression) |
 | Appui moyen (relâché entre 0,6 et 3 s) | <!-- ⚫ AJOUTÉ (24/10/2026) --> écran **Code Wi-Fi** : nom du réseau, mot de passe et QR code pour y connecter un téléphone (appui = retour, fermeture auto après 1 min) |

@@ -2,6 +2,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include "nvs.h"
+// ⚫ AJOUTÉ (25/10/2026) : mémoire RTC conservée à travers esp_restart()
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "app.h"
 
@@ -85,25 +87,40 @@ void app_config_save_zoom(int idx) {
     }
 }
 
+// ⚫ MODIFIÉ (25/10/2026) : la demande de portail passe par la mémoire RTC (survit à esp_restart(), effacée
+// à la mise sous tension) au lieu de la NVS : plus d'écriture en flash au démarrage, écran déjà allumé.
+// Anciennes versions (clé NVS "portal") :
+// void app_config_set_force_portal(bool on) {
+//     nvs_handle_t h;
+//     if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+//         nvs_set_u8(h, "portal", on ? 1 : 0);
+//         nvs_commit(h);
+//         nvs_close(h);
+//     }
+// }
+//
+// bool app_config_take_force_portal(void) {
+//     nvs_handle_t h;
+//     uint8_t v = 0;
+//     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+//         return false;
+//     }
+//     if (nvs_get_u8(h, "portal", &v) == ESP_OK && v) {
+//         nvs_set_u8(h, "portal", 0);
+//         nvs_commit(h);
+//     }
+//     nvs_close(h);
+//     return v != 0;
+// }
+#define FORCE_PORTAL_MAGIC 0x52414456u   // "RADV"
+static RTC_NOINIT_ATTR uint32_t s_force_portal;
+
 void app_config_set_force_portal(bool on) {
-    nvs_handle_t h;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_u8(h, "portal", on ? 1 : 0);
-        nvs_commit(h);
-        nvs_close(h);
-    }
+    s_force_portal = on ? FORCE_PORTAL_MAGIC : 0;
 }
 
 bool app_config_take_force_portal(void) {
-    nvs_handle_t h;
-    uint8_t v = 0;
-    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
-        return false;
-    }
-    if (nvs_get_u8(h, "portal", &v) == ESP_OK && v) {
-        nvs_set_u8(h, "portal", 0);
-        nvs_commit(h);
-    }
-    nvs_close(h);
-    return v != 0;
+    bool v = s_force_portal == FORCE_PORTAL_MAGIC;
+    s_force_portal = 0;
+    return v;
 }

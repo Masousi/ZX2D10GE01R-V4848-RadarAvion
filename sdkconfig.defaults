@@ -49,4 +49,9 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 # si elle "glisse" (écritures en flash, forte charge)
 # CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 # ⚫ RETIRÉ (24/10/2026) : ligne de cache 64 o retirée (même raison, valeur d'origine 32 o qui fonctionnait)
-CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
+# CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
+# ⚫ RETIRÉ (25/10/2026) : la relance du DMA à chaque VSYNC décalait l'image (clignotement, image dédoublée)
+# quand l'interruption arrivait en retard. Conséquence : aucune écriture en flash (NVS) pendant
+# l'affichage (elles peuvent désynchroniser l'écran sans possibilité de rattrapage).
+# ⚫ 25/10/2026 : vraie cause du clignotement : la relance repart toujours du buffer 0 (IDF 5.0.9). Le décalage
+# est maintenant rattrapé par main/screen.c (relance seulement quand le buffer 0 vient d'être programmé).

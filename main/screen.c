@@ -30,6 +30,8 @@ static button_t *g_btn;
 static esp_lcd_panel_handle_t g_panel_handle = NULL;
 // ⚫ AJOUTÉ (24/10/2026) : donné à chaque VSYNC (fin de trame) par __qsmd_rgb_on_vsync()
 static SemaphoreHandle_t s_vsync_sem;
+// ⚫ AJOUTÉ (25/10/2026) : frame buffer 0 du panneau (seul buffer depuis lequel le DMA peut être relancé)
+static void *s_fb0;
 
 static void __qsmd_rgb_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_p)
 {
@@ -57,6 +59,8 @@ static void __qsmd_rgb_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area
     esp_lcd_panel_draw_bitmap(g_panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_p);
     // ⚫ AJOUTÉ (24/10/2026) : draw_bitmap() vide le cache vers la PSRAM (460 Ko) : il doit rester bien
     // plus court qu'une trame (~17 ms) pour que l'étape 2 tombe loin de la fin de trame. Contrôle série :
+    // ⚫ 25/10/2026 : en mode bounce buffer, draw_bitmap() ne vide plus le cache (le CPU relit la PSRAM via le
+    // cache) : il ne fait que programmer le buffer, quelques µs.
     static int64_t s_bmp_max_us;
     static int s_bmp_n;
     int64_t dt = esp_timer_get_time() - t0;
@@ -68,17 +72,82 @@ static void __qsmd_rgb_disp_flush(lv_disp_drv_t *disp_drv, const lv_area_t *area
         s_bmp_n = 0;
         s_bmp_max_us = 0;
     }
+    // ⚫ MODIFIÉ (25/10/2026) : avec les bounce buffers (cf. screen_init), s_vsync_sem est donné quand le
+    // pilote a fini de COPIER une trame complète vers les bounce buffers et prend le buffer programmé
+    // (bb_fb_index = cur_fb_index) : l'ancien buffer n'est plus lu du tout, LVGL peut y dessiner.
+    // Même interruption, même cœur que cette tâche -> aucune course possible.
+    // xSemaphoreTake(s_vsync_sem, 0);
+    // xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(50));
+    // ⚫ MODIFIÉ (25/10/2026) : bounce buffers et CONFIG_LCD_RGB_RESTART_IN_VSYNC retirés (image décalée et
+    // dédoublée horizontalement : la relance du DMA à chaque VSYNC tombait parfois en pleine ligne).
+    // Sans relance, le DMA passe sur le nouveau buffer en fin de trame, en suivant le chaînage des
+    // descripteurs (dont le dernier est lu ~4 lignes avant la fin). On attend DEUX VSYNC après
+    // draw_bitmap() : VSYNC A = fin de la trame en cours (bascule faite, ou ratée si draw_bitmap() est
+    // tombé juste après la lecture du dernier descripteur), VSYNC B = fin de la trame suivante : dans les
+    // deux cas l'ancien buffer n'est plus lu, LVGL peut y dessiner. ~1,5 trame d'attente en moyenne.
+    // ⚫ AJOUTÉ (25/10/2026) : resynchronisation de l'écran. Une lecture/écriture en flash (NVS, Wi-Fi au
+    // démarrage) suspend le cache : le DMA prend du retard et l'image reste décalée horizontalement
+    // (bord droit qui réapparaît à gauche) tant que le DMA n'est pas relancé. esp_lcd_rgb_panel_restart()
+    // relance le DMA au VSYNC suivant, mais (IDF 5.0.9) TOUJOURS depuis le début du buffer 0 : on ne la
+    // demande donc que lorsque le buffer qu'on vient de programmer EST le buffer 0, au plus 1 fois/s.
+    // (C'est aussi pourquoi CONFIG_LCD_RGB_RESTART_IN_VSYNC, relance à chaque trame, faisait clignoter :
+    // une image sur deux, l'écran réaffichait l'ancien contenu du buffer 0.)
+    static int64_t s_last_restart_us;
+    if (color_p == s_fb0 && t0 - s_last_restart_us > 1000000) {
+        esp_lcd_rgb_panel_restart(g_panel_handle);
+        s_last_restart_us = t0;
+    }
     xSemaphoreTake(s_vsync_sem, 0);
+    xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(50));
     xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(50));
     lv_disp_flush_ready(disp_drv);
 }
 
 // ⚫ AJOUTÉ (24/10/2026) : interruption de fin de trame (VSYNC) -> débloque __qsmd_rgb_disp_flush()
+// ⚫ MODIFIÉ (25/10/2026) : branchée sur on_bounce_frame_finish (fin de copie d'une trame) au lieu de on_vsync
+// ⚫ MODIFIÉ (25/10/2026) : de nouveau branchée sur on_vsync (bounce buffers retirés)
 static IRAM_ATTR bool __qsmd_rgb_on_vsync(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx)
 {
     BaseType_t woken = pdFALSE;
     xSemaphoreGiveFromISR(s_vsync_sem, &woken);
     return woken == pdTRUE;
+}
+
+// ⚫ AJOUTÉ (25/10/2026) : mesure du rendu LVGL (temps de rendu + flush, appelé après chaque image)
+static void __qsmd_rgb_monitor(lv_disp_drv_t *disp_drv, uint32_t time_ms, uint32_t px)
+{
+    static uint32_t s_sum_ms, s_max_ms, s_n;
+    s_sum_ms += time_ms;
+    if (time_ms > s_max_ms) {
+        s_max_ms = time_ms;
+    }
+    if (++s_n == 300) {
+        ESP_LOGI(TAG, "rendu LVGL : moyen %u ms, max %u ms (300 images)", (unsigned)(s_sum_ms / s_n), (unsigned)s_max_ms);
+        s_sum_ms = s_max_ms = s_n = 0;
+    }
+}
+
+// ⚫ AJOUTÉ (25/10/2026) : le panneau est créé depuis le cœur 0. Ses interruptions (copie PSRAM -> bounce
+// buffers, ~30 Mo/s) sont attachées au cœur qui crée le panneau : sur le cœur 0, elles ne ralentissent
+// pas le rendu LVGL (cœur 1).
+typedef struct {
+    esp_lcd_rgb_panel_config_t *cfg;
+    SemaphoreHandle_t done;
+} panel_create_args_t;
+
+static void __qsmd_rgb_create_task(void *arg)
+{
+    panel_create_args_t *a = (panel_create_args_t *)arg;
+    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(a->cfg, &g_panel_handle));
+    esp_lcd_rgb_panel_event_callbacks_t cbs = {
+        // .on_vsync = __qsmd_rgb_on_vsync,
+        // .on_bounce_frame_finish = __qsmd_rgb_on_vsync,
+        // ⚫ MODIFIÉ (25/10/2026) : bounce buffers retirés -> VSYNC
+        .on_vsync = __qsmd_rgb_on_vsync,
+    };
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(g_panel_handle, &cbs, NULL));
+    xSemaphoreGive(a->done);
+    vTaskDelete(NULL);
 }
 
 void qmsd_rgb_init(esp_lcd_rgb_panel_config_t *panel_config)
@@ -91,18 +160,27 @@ void qmsd_rgb_init(esp_lcd_rgb_panel_config_t *panel_config)
 
     lv_init();
 
-    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(panel_config, &g_panel_handle));
+    // ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(panel_config, &g_panel_handle));
     // ⚫ AJOUTÉ (24/10/2026) : synchronisation de l'affichage sur le VSYNC (cf. __qsmd_rgb_disp_flush)
     s_vsync_sem = xSemaphoreCreateBinary();
-    esp_lcd_rgb_panel_event_callbacks_t cbs = {
-        .on_vsync = __qsmd_rgb_on_vsync,
-    };
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(g_panel_handle, &cbs, NULL));
+    // esp_lcd_rgb_panel_event_callbacks_t cbs = {
+    //     .on_vsync = __qsmd_rgb_on_vsync,
+    // };
+    // ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(g_panel_handle, &cbs, NULL));
+    // ⚫ MODIFIÉ (25/10/2026) : création du panneau + callbacks sur le cœur 0 (cf. __qsmd_rgb_create_task)
+    panel_create_args_t args = { .cfg = panel_config, .done = xSemaphoreCreateBinary() };
+    // xTaskCreatePinnedToCore(__qsmd_rgb_create_task, "lcd_init", 4096, &args, 5, NULL, 0);
+    // ⚫ MODIFIÉ (25/10/2026) : cœur 1 (comme à l'origine) : sans bounce buffer, l'interruption ne fait que
+    // signaler le VSYNC ; sur le cœur 0 elle serait retardée par le Wi-Fi
+    xTaskCreatePinnedToCore(__qsmd_rgb_create_task, "lcd_init", 4096, &args, 5, NULL, 1);
+    xSemaphoreTake(args.done, portMAX_DELAY);
+    vSemaphoreDelete(args.done);
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel_handle));
 
     buffer_size = panel_config->timings.h_res * panel_config->timings.v_res;
     esp_lcd_rgb_panel_get_frame_buffer(g_panel_handle, 2, &buf1, &buf2);
+    s_fb0 = buf1;   // ⚫ AJOUTÉ (25/10/2026) : cf. resynchronisation dans __qsmd_rgb_disp_flush()
     lv_disp_draw_buf_init(&draw_buf, buf1, buf2, buffer_size);
 
     lv_disp_drv_init(&disp_drv);         
@@ -116,6 +194,8 @@ void qmsd_rgb_init(esp_lcd_rgb_panel_config_t *panel_config)
     // animation, le panneau affiche un buffer quasi vide : écran noir.
     // full_refresh : chaque image est redessinée entièrement dans le buffer suivant (cf. exemple IDF rgb_panel).
     disp_drv.full_refresh = 1;
+    // ⚫ AJOUTÉ (25/10/2026) : statistiques de rendu sur le port série
+    disp_drv.monitor_cb = __qsmd_rgb_monitor;
     lv_disp_drv_register(&disp_drv);
 }
 
@@ -528,6 +608,17 @@ void screen_init(void) {
         .flags.fb_in_psram = 1,
         .flags.double_fb = 1,
         .flags.refresh_on_demand = 0,   // Mannually control refresh operation
+        // .bounce_buffer_size_px = 0,
+        // ⚫ MODIFIÉ (25/10/2026) : correction du clignotement avec le Wi-Fi. Sans bounce buffer, le DMA de
+        // l'écran lit l'image directement en PSRAM (30 Mo/s en continu) ; quand LVGL + Wi-Fi saturent la
+        // PSRAM, le DMA manque de données -> image qui saute / clignote. Avec 2 bounce buffers de 10 lignes
+        // en RAM interne (2 x 9,6 Ko), le DMA ne lit que la RAM interne ; le CPU (interruptions, cœur 0)
+        // recopie la PSRAM dans ces tampons. Recommandation Espressif pour ESP32-S3 + Wi-Fi + PSRAM.
+        // (taille de l'image = multiple pair de la taille d'un bounce buffer : 480x480 / (2 x 4800) = 24)
+        // .bounce_buffer_size_px = 480 * 10,
+        // ⚫ RETIRÉ (25/10/2026) : bounce buffers : avec la relance du DMA à chaque VSYNC, interruptions en
+        // retard (cœur 0 + Wi-Fi) -> image décalée et répétée horizontalement. Retour à la configuration
+        // d'origine (DMA lisant directement les frame buffers en PSRAM), qui affichait les démos sans défaut.
         .bounce_buffer_size_px = 0,
         .clk_src = LCD_CLK_SRC_PLL160M,
     };

@@ -313,38 +313,52 @@ static void bg_text(int x, int y, int w, const char *txt, const lv_font_t *font,
 // Fond fixe du radar, redessiné uniquement quand le zoom change (distances des cercles)
 static void render_background(void) {
     int64_t t0 = esp_timer_get_time();
-    lv_canvas_fill_bg(s_bg, lv_color_black(), LV_OPA_COVER);
-    // dégradé radial approché par 3 disques
-    bg_disc(R_RADAR, C_DISC0);
-    bg_disc(R_RADAR * 7 / 10, C_DISC1);
-    bg_disc(R_RADAR * 4 / 10, C_DISC2);
-    // cercles de distance
-    for (int k = 1; k <= 4; k++) {
-        lv_draw_arc_dsc_t d;
-        lv_draw_arc_dsc_init(&d);
-        d.color = lv_color_hex(C_RING);
-        d.width = k == 4 ? 2 : 1;
-        d.opa = k == 4 ? 220 : 110;
-        lv_canvas_draw_arc(s_bg, CX, CY, R_RADAR * k / 4, 0, 360, &d);
-    }
-    // croix
-    bg_line(CX - R_RADAR, CY, CX + R_RADAR, CY, 1, 70);
-    bg_line(CX, CY - R_RADAR, CX, CY + R_RADAR, 1, 70);
-    // graduations tous les 10° (plus longues tous les 30°)
-    for (int deg = 0; deg < 360; deg += 10) {
-        float a = deg * DEG2RAD, sn = sinf(a), cs = cosf(a);
-        int len = (deg % 30 == 0) ? 12 : 6;
-        bg_line(CX + (int)lroundf((R_RADAR - len) * sn), CY - (int)lroundf((R_RADAR - len) * cs),
-                CX + (int)lroundf(R_RADAR * sn), CY - (int)lroundf(R_RADAR * cs),
-                deg % 30 == 0 ? 2 : 1, 200);
-    }
-    // points cardinaux dans la marge extérieure
-    static const char *CARD[4] = { "N", "E", "S", "O" };
-    for (int i = 0; i < 4; i++) {
-        float a = i * 90 * DEG2RAD;
-        int x = CX + (int)lroundf(R_CARDINAL * sinf(a));
-        int y = CY - (int)lroundf(R_CARDINAL * cosf(a));
-        bg_text(x - 12, y - 9, 24, CARD[i], &lv_font_montserrat_16, i == 0 ? C_NORTH : C_LABEL, LV_TEXT_ALIGN_CENTER);
+    // ⚫ AJOUTÉ (25/10/2026) : la partie fixe (disques, cercles, graduations, points cardinaux) est dessinée
+    // une seule fois puis recopiée : un cran de zoom ne fige plus l'écran 172 ms, seules les distances changent
+    static uint8_t *s_base;
+    size_t sz = LV_CANVAS_BUF_SIZE_TRUE_COLOR(480, 480);
+    uint8_t *buf = (uint8_t *)lv_canvas_get_img(s_bg)->data;
+    if (s_base) {
+        memcpy(buf, s_base, sz);
+        lv_obj_invalidate(s_bg);
+    } else {
+        lv_canvas_fill_bg(s_bg, lv_color_black(), LV_OPA_COVER);
+        // dégradé radial approché par 3 disques
+        bg_disc(R_RADAR, C_DISC0);
+        bg_disc(R_RADAR * 7 / 10, C_DISC1);
+        bg_disc(R_RADAR * 4 / 10, C_DISC2);
+        // cercles de distance
+        for (int k = 1; k <= 4; k++) {
+            lv_draw_arc_dsc_t d;
+            lv_draw_arc_dsc_init(&d);
+            d.color = lv_color_hex(C_RING);
+            d.width = k == 4 ? 2 : 1;
+            d.opa = k == 4 ? 220 : 110;
+            lv_canvas_draw_arc(s_bg, CX, CY, R_RADAR * k / 4, 0, 360, &d);
+        }
+        // croix
+        bg_line(CX - R_RADAR, CY, CX + R_RADAR, CY, 1, 70);
+        bg_line(CX, CY - R_RADAR, CX, CY + R_RADAR, 1, 70);
+        // graduations tous les 10° (plus longues tous les 30°)
+        for (int deg = 0; deg < 360; deg += 10) {
+            float a = deg * DEG2RAD, sn = sinf(a), cs = cosf(a);
+            int len = (deg % 30 == 0) ? 12 : 6;
+            bg_line(CX + (int)lroundf((R_RADAR - len) * sn), CY - (int)lroundf((R_RADAR - len) * cs),
+                    CX + (int)lroundf(R_RADAR * sn), CY - (int)lroundf(R_RADAR * cs),
+                    deg % 30 == 0 ? 2 : 1, 200);
+        }
+        // points cardinaux dans la marge extérieure
+        static const char *CARD[4] = { "N", "E", "S", "O" };
+        for (int i = 0; i < 4; i++) {
+            float a = i * 90 * DEG2RAD;
+            int x = CX + (int)lroundf(R_CARDINAL * sinf(a));
+            int y = CY - (int)lroundf(R_CARDINAL * cosf(a));
+            bg_text(x - 12, y - 9, 24, CARD[i], &lv_font_montserrat_16, i == 0 ? C_NORTH : C_LABEL, LV_TEXT_ALIGN_CENTER);
+        }
+        s_base = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+        if (s_base) {
+            memcpy(s_base, buf, sz);
+        }
     }
     // distances des cercles (niveau de zoom choisi), le long du relèvement 30°
     char t[16];
@@ -842,7 +856,9 @@ static void ui_tick(lv_timer_t *t) {
         }
         if (s_zoom_save_at_ms && now >= s_zoom_save_at_ms) {
             s_zoom_save_at_ms = 0;
-            app_config_save_zoom(s_zoom_idx);
+            // app_config_save_zoom(s_zoom_idx);
+            // ⚫ RETIRÉ (25/10/2026) : écriture en flash pendant l'affichage = risque de désynchroniser
+            // l'écran (cf. sdkconfig.defaults) ; le zoom repart du niveau par défaut au démarrage
         }
     }
 
